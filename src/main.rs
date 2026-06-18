@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::Command;
@@ -59,25 +58,6 @@ fn build_bar(pct: u32, width: usize) -> String {
     } else {
         format!("{DIM}{bar_color}{empty_str}{RESET}")
     }
-}
-
-// Parse an ISO-8601 timestamp (e.g. session start_time) into UTC.
-fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    let trimmed = s.trim_end_matches('Z');
-    if let Ok(dt) =
-        chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S")
-    {
-        return Some(dt.and_utc());
-    }
-    if let Ok(dt) =
-        chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
-    {
-        return Some(dt.and_utc());
-    }
-    None
 }
 
 // A rate-limit window is expired once its reset time has passed: the
@@ -182,13 +162,11 @@ fn main() {
     };
 
     // ── Thinking status ───────────────────────────────
-    let home = env::var("HOME").unwrap_or_default();
-    let settings_path = format!("{home}/.claude/settings.json");
-    let thinking_on = fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .and_then(|v| v["alwaysThinkingEnabled"].as_bool())
-        .unwrap_or(false);
+    // Read the live session state from stdin (`thinking.enabled`) rather than
+    // the global `~/.claude/settings.json` `alwaysThinkingEnabled` flag — the
+    // stdin field reflects whether extended thinking is actually on for THIS
+    // session. Absent (older models / not applicable) is treated as off.
+    let thinking_on = json["thinking"]["enabled"].as_bool().unwrap_or(false);
 
     // ── Directory + Git ───────────────────────────────
     let cwd = json["cwd"]
@@ -210,14 +188,15 @@ fn main() {
     let (git_branch, git_dirty) = get_git_info(&cwd);
 
     // ── Session duration ──────────────────────────────
-    let session_duration = json["session"]["start_time"]
-        .as_str()
-        .and_then(parse_iso)
-        .map(|start| {
-            let secs = Utc::now()
-                .signed_duration_since(start)
-                .num_seconds()
-                .max(0) as u64;
+    // From stdin `cost.total_duration_ms` (wall-clock ms for the session).
+    // The old code read `session.start_time`, which the statusLine payload
+    // does not contain — so the ⏱ segment never rendered. This uses the real
+    // field. Absent/zero → no segment.
+    let session_duration = json["cost"]["total_duration_ms"]
+        .as_f64()
+        .map(|ms| (ms / 1000.0).max(0.0) as u64)
+        .filter(|&secs| secs > 0)
+        .map(|secs| {
             if secs >= 3600 {
                 format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
             } else if secs >= 60 {
@@ -245,6 +224,27 @@ fn main() {
         out.push_str(&format!(
             " {GREEN}({git_branch}{RED}{git_dirty}{GREEN}){RESET}"
         ));
+    }
+
+    // Reasoning effort level (stdin `effort.level`) — only for models that
+    // support it; absent otherwise.
+    if let Some(level) = json["effort"]["level"].as_str() {
+        out.push_str(&format!("{sep}{DIM}effort{RESET} {WHITE}{level}{RESET}"));
+    }
+
+    // Estimated session cost in USD (stdin `cost.total_cost_usd`). Client-side
+    // estimate, may differ from the actual bill. Skip when absent or zero.
+    if let Some(cost) = json["cost"]["total_cost_usd"].as_f64() {
+        if cost > 0.0 {
+            out.push_str(&format!("{sep}{DIM}${RESET}{WHITE}{cost:.2}{RESET}"));
+        }
+    }
+
+    // Claude Code app version (stdin `version`).
+    if let Some(ver) = json["version"].as_str() {
+        if !ver.is_empty() {
+            out.push_str(&format!("{sep}{DIM}v{ver}{RESET}"));
+        }
     }
 
     if let Some(ref dur) = session_duration {
