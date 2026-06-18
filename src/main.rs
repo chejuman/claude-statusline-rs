@@ -3,9 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, SystemTime};
-
-use chrono::{DateTime, Datelike, Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde_json::Value;
 
 // ── ANSI Colors ────────────────────────────────────────
@@ -63,30 +61,41 @@ fn build_bar(pct: u32, width: usize) -> String {
     }
 }
 
+// Parse an ISO-8601 timestamp (e.g. session start_time) into UTC.
 fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
-    // Try RFC3339 first, then common variants
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
-    // Try without fractional seconds: "2026-03-09T12:30:00Z"
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
-        s.trim_end_matches('Z'),
-        "%Y-%m-%dT%H:%M:%S",
-    ) {
+    let trimmed = s.trim_end_matches('Z');
+    if let Ok(dt) =
+        chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S")
+    {
         return Some(dt.and_utc());
     }
-    // Try with fractional: "2026-03-09T12:30:00.123Z"
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
-        s.trim_end_matches('Z'),
-        "%Y-%m-%dT%H:%M:%S%.f",
-    ) {
+    if let Ok(dt) =
+        chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+    {
         return Some(dt.and_utc());
     }
     None
 }
 
-fn format_reset_time(iso_str: &str, style: &str) -> Option<String> {
-    let dt = parse_iso(iso_str)?;
+// A rate-limit window is expired once its reset time has passed: the
+// usage it reports describes a window that no longer exists. The statusLine
+// stdin payload gives `resets_at` as Unix epoch SECONDS. Treat a
+// missing/invalid value as expired so we never show a window we can't
+// anchor in time.
+fn reset_is_in_future(resets_at: Option<i64>) -> bool {
+    match resets_at {
+        Some(epoch) => epoch > Utc::now().timestamp(),
+        None => false,
+    }
+}
+
+// Format a Unix-epoch-seconds reset time for display in the local timezone.
+// `style` "time" → "9:00am", "datetime" → "jun 18, 9:00am".
+fn format_reset_epoch(epoch: i64, style: &str) -> Option<String> {
+    let dt = DateTime::<Utc>::from_timestamp(epoch, 0)?;
     let local: DateTime<Local> = dt.into();
 
     let formatted = match style {
@@ -120,133 +129,6 @@ fn get_git_info(cwd: &str) -> (String, String) {
         .unwrap_or_default();
 
     (branch, dirty)
-}
-
-fn get_oauth_token() -> Option<String> {
-    // 1. Environment variable
-    if let Ok(token) = env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
-    }
-
-    // 2. macOS Keychain
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(token) = extract_token_from_command(
-            Command::new("security")
-                .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"]),
-        ) {
-            return Some(token);
-        }
-    }
-
-    // 3. Credentials file
-    let home = env::var("HOME").unwrap_or_default();
-    let creds_path = format!("{home}/.claude/.credentials.json");
-    if let Some(token) = extract_token_from_file(&creds_path) {
-        return Some(token);
-    }
-
-    // 4. Linux secret-tool
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(token) = extract_token_from_command(
-            Command::new("secret-tool")
-                .args(["lookup", "service", "Claude Code-credentials"]),
-        ) {
-            return Some(token);
-        }
-    }
-
-    None
-}
-
-fn extract_token_from_command(cmd: &mut Command) -> Option<String> {
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let blob = String::from_utf8(output.stdout).ok()?;
-    let json: Value = serde_json::from_str(blob.trim()).ok()?;
-    json["claudeAiOauth"]["accessToken"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn extract_token_from_file(path: &str) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&content).ok()?;
-    json["claudeAiOauth"]["accessToken"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn read_cache(cache_file: &str) -> Option<Value> {
-    fs::read_to_string(cache_file)
-        .ok()
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .filter(|v| v.get("five_hour").is_some())
-}
-
-fn fetch_usage_data() -> Option<Value> {
-    let cache_dir = "/tmp/claude";
-    let cache_file = format!("{cache_dir}/statusline-usage-cache.json");
-    let cache_max_age = 60u64;
-
-    // Check cache freshness
-    let cache_age = fs::metadata(&cache_file)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .map(|d| d.as_secs());
-
-    if let Some(age) = cache_age {
-        if age < cache_max_age {
-            if let Some(cached) = read_cache(&cache_file) {
-                return Some(cached);
-            }
-        }
-    }
-
-    // Fetch fresh data
-    let token = match get_oauth_token() {
-        Some(t) => t,
-        None => return read_cache(&cache_file), // stale cache fallback
-    };
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build();
-
-    let response = match agent
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .set("Accept", "application/json")
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("anthropic-beta", "oauth-2025-04-20")
-        .set("User-Agent", "claude-statusline-rs/0.1.0")
-        .call()
-    {
-        Ok(r) => r,
-        Err(_) => return read_cache(&cache_file), // stale cache fallback on HTTP error
-    };
-
-    let body = match response.into_string() {
-        Ok(b) => b,
-        Err(_) => return read_cache(&cache_file),
-    };
-
-    let json: Value = match serde_json::from_str::<Value>(&body) {
-        Ok(v) if v.get("five_hour").is_some() => v,
-        _ => return read_cache(&cache_file), // rate limit error → stale cache
-    };
-
-    fs::create_dir_all(cache_dir).ok();
-    fs::write(&cache_file, &body).ok();
-    Some(json)
 }
 
 // ── Main ───────────────────────────────────────────────
@@ -350,7 +232,13 @@ fn main() {
 
     let mut out = String::with_capacity(512);
     out.push_str(&format!("{BLUE}{model_name}{RESET}"));
-    out.push_str(&format!("{sep}✍\u{fe0f} {pct_color}{pct_used}%{RESET}"));
+    // Writing-hand WITHOUT the VS16 (U+FE0F) emoji-presentation selector.
+    // The real cause of the tmux corruption was the VS16, not the glyph: it
+    // forces emoji presentation (font draws 2 cells) while tmux measures the
+    // base U+270D as 1 cell — so the cells after it get clobbered. Dropping
+    // VS16 keeps the icon but makes width agree (1 cell), exactly like the
+    // ⏱ session glyph that never broke. A trailing space mirrors ⏱ 's padding.
+    out.push_str(&format!("{sep}{DIM}✍ {RESET}{pct_color}{pct_used}%{RESET}"));
     out.push_str(&format!("{sep}{CYAN}{dirname}{RESET}"));
 
     if !git_branch.is_empty() {
@@ -371,73 +259,49 @@ fn main() {
     }
 
     // ── RATE LIMITS ───────────────────────────────────
-    if let Some(usage) = fetch_usage_data() {
+    // Claude Code passes subscription usage into the statusLine command via
+    // the stdin JSON `rate_limits` object — no OAuth/Keychain/API call needed.
+    // The object is present only for Pro/Max subscribers after the session's
+    // first API response, and each window may be independently absent.
+    //   rate_limits.five_hour.used_percentage : number 0-100   ("current")
+    //   rate_limits.five_hour.resets_at       : Unix epoch seconds
+    //   rate_limits.seven_day.{used_percentage,resets_at}       ("weekly")
+    {
         let bar_width = 10;
+        let rl = &json["rate_limits"];
 
-        // 5-hour
-        let five_pct = usage["five_hour"]["utilization"]
-            .as_f64()
-            .unwrap_or(0.0) as u32;
-        let five_reset = usage["five_hour"]["resets_at"]
-            .as_str()
-            .and_then(|s| format_reset_time(s, "time"))
-            .unwrap_or_default();
-        let five_bar = build_bar(five_pct, bar_width);
-        let five_color = color_for_pct(five_pct);
+        // 5-hour ("current") — only when present and its window is in the future.
+        let five_reset = rl["five_hour"]["resets_at"].as_i64();
+        if reset_is_in_future(five_reset) {
+            if let Some(five_pct) = rl["five_hour"]["used_percentage"].as_f64() {
+                let five_pct = five_pct.round() as u32;
+                let five_reset_str = five_reset
+                    .and_then(|e| format_reset_epoch(e, "time"))
+                    .unwrap_or_default();
+                let five_bar = build_bar(five_pct, bar_width);
+                let five_color = color_for_pct(five_pct);
 
-        out.push_str(&format!(
-            "\n\n{WHITE}current{RESET} {five_bar} {five_color}{five_pct:3}%{RESET} {DIM}⟳{RESET} {WHITE}{five_reset}{RESET}"
-        ));
+                out.push_str(&format!(
+                    "\n\n{WHITE}current{RESET} {five_bar} {five_color}{five_pct:3}%{RESET} {DIM}⟳{RESET} {WHITE}{five_reset_str}{RESET}"
+                ));
+            }
+        }
 
-        // 7-day
-        let seven_pct = usage["seven_day"]["utilization"]
-            .as_f64()
-            .unwrap_or(0.0) as u32;
-        let seven_reset = usage["seven_day"]["resets_at"]
-            .as_str()
-            .and_then(|s| format_reset_time(s, "datetime"))
-            .unwrap_or_default();
-        let seven_bar = build_bar(seven_pct, bar_width);
-        let seven_color = color_for_pct(seven_pct);
+        // 7-day ("weekly") — same presence + expiry guard.
+        let seven_reset = rl["seven_day"]["resets_at"].as_i64();
+        if reset_is_in_future(seven_reset) {
+            if let Some(seven_pct) = rl["seven_day"]["used_percentage"].as_f64() {
+                let seven_pct = seven_pct.round() as u32;
+                let seven_reset_str = seven_reset
+                    .and_then(|e| format_reset_epoch(e, "datetime"))
+                    .unwrap_or_default();
+                let seven_bar = build_bar(seven_pct, bar_width);
+                let seven_color = color_for_pct(seven_pct);
 
-        out.push_str(&format!(
-            "\n{WHITE}weekly{RESET}  {seven_bar} {seven_color}{seven_pct:3}%{RESET} {DIM}⟳{RESET} {WHITE}{seven_reset}{RESET}"
-        ));
-
-        // Extra usage
-        if usage["extra_usage"]["is_enabled"]
-            .as_bool()
-            .unwrap_or(false)
-        {
-            let extra_pct = usage["extra_usage"]["utilization"]
-                .as_f64()
-                .unwrap_or(0.0) as u32;
-            let extra_used = usage["extra_usage"]["used_credits"]
-                .as_f64()
-                .unwrap_or(0.0)
-                / 100.0;
-            let extra_limit = usage["extra_usage"]["monthly_limit"]
-                .as_f64()
-                .unwrap_or(0.0)
-                / 100.0;
-            let extra_bar = build_bar(extra_pct, bar_width);
-            let extra_color = color_for_pct(extra_pct);
-
-            // Next month 1st
-            let now = Local::now();
-            let month_names = [
-                "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
-                "dec",
-            ];
-            let next_month_idx = if now.month() == 12 { 0 } else { now.month() as usize };
-            let next_reset = format!("{} 1", month_names[next_month_idx]);
-
-            out.push_str(&format!(
-                "\n{WHITE}extra{RESET}   {extra_bar} {extra_color}${extra_used:.2}{DIM}/{RESET}{WHITE}${extra_limit:.2}{RESET}"
-            ));
-            out.push_str(&format!(
-                "\n{DIM}resets {RESET}{WHITE}{next_reset}{RESET}"
-            ));
+                out.push_str(&format!(
+                    "\n{WHITE}weekly{RESET}  {seven_bar} {seven_color}{seven_pct:3}%{RESET} {DIM}⟳{RESET} {WHITE}{seven_reset_str}{RESET}"
+                ));
+            }
         }
     }
 
