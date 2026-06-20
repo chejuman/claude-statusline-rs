@@ -236,7 +236,15 @@ fn main() {
     // estimate, may differ from the actual bill. Skip when absent or zero.
     if let Some(cost) = json["cost"]["total_cost_usd"].as_f64() {
         if cost > 0.0 {
-            out.push_str(&format!("{sep}{DIM}${RESET}{WHITE}{cost:.2}{RESET}"));
+            // Abbreviate large values for readability: $13.37, $1.23K, $1.34M.
+            let cost_str = if cost >= 1_000_000.0 {
+                format!("{:.2}M", cost / 1_000_000.0)
+            } else if cost >= 1_000.0 {
+                format!("{:.2}K", cost / 1_000.0)
+            } else {
+                format!("{cost:.2}")
+            };
+            out.push_str(&format!("{sep}{DIM}${RESET}{WHITE}{cost_str}{RESET}"));
         }
     }
 
